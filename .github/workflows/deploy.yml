@@ -29,27 +29,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # --- ADD THIS NEW STEP ---
+      - name: 🐞 Debug AWS Region
+        run: |
+          echo "Checking the AWS_REGION variable..."
+          if [ -z "${{ env.AWS_REGION }}" ]; then
+            echo "ERROR: AWS_REGION env variable is empty."
+            echo "This means the 'AWS_REGION' secret is NOT set correctly in GitHub Settings."
+            exit 1
+          else
+            echo "SUCCESS: AWS_REGION is set to: ${{ env.AWS_REGION }}"
+          fi
+      # --- END OF NEW STEP ---
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init
-        run: terraform -chdir=${{ env.TF_DIR }} init
-
-      - name: Terraform Apply (ECR Repo Only)
-        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -target=aws_ecr_repository.main
-
-      - name: Get ECR Repo URL
-        id: tf_output
-        run: |
-          REPO_URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url)
-          echo "ecr_repo_url=$REPO_URL" >> $GITHUB_OUTPUT
-
+      # ... (rest of the job) ...
   # -----------------------------------------------------------------
   # Job 2: Build and Push Docker Image
   # This job runs *after* the ECR repo is created.

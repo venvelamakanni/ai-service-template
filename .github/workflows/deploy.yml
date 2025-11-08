@@ -1,0 +1,119 @@
+name: Build, Push, and Deploy to AWS
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write # Required for GitHub OIDC
+  contents: read  # Required to checkout the code
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }} # Set region from GitHub Secret
+  APP_NAME: "ai-service"                # App name
+  TF_DIR: "./terraform"                 # Terraform directory
+
+jobs:
+  # -----------------------------------------------------------------
+  # Job 1: Deploy Base Infra (ECR Repo)
+  # This job creates the ECR repo *first*, so the build job can push to it.
+  # -----------------------------------------------------------------
+  deploy-base-infra:
+    name: 1. Deploy Base Infra (ECR)
+    runs-on: ubuntu-latest
+    
+    outputs:
+      ecr_repo_url: ${{ steps.tf_output.outputs.ecr_repo_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform -chdir=${{ env.TF_DIR }} init
+
+      - name: Terraform Apply (ECR Repo Only)
+        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -target=aws_ecr_repository.main
+
+      - name: Get ECR Repo URL
+        id: tf_output
+        run: |
+          REPO_URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url)
+          echo "ecr_repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+
+  # -----------------------------------------------------------------
+  # Job 2: Build and Push Docker Image
+  # This job runs *after* the ECR repo is created.
+  # -----------------------------------------------------------------
+  build-and-push-image:
+    name: 2. Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: deploy-base-infra # Waits for Job 1 to finish
+    
+    outputs:
+      image_tag: ${{ steps.get_sha.outputs.sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get Git commit SHA
+        id: get_sha
+        run: echo "sha=$(echo ${GITHUB_SHA::7})" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REPOSITORY_URL: ${{ needs.deploy-base-infra.outputs.ecr_repo_url }}
+          IMAGE_TAG: ${{ steps.get_sha.outputs.sha }}
+        run: |
+          docker build -t $ECR_REPOSITORY_URL:$IMAGE_TAG .
+          docker push $ECR_REPOSITORY_URL:$IMAGE_TAG
+
+  # -----------------------------------------------------------------
+  # Job 3: Deploy App Service
+  # This job runs *after* the image is built and pushed.
+  # -----------------------------------------------------------------
+  deploy-app-service:
+    name: 3. Deploy App Service
+    runs-on: ubuntu-latest
+    needs: build-and-push-image # Waits for Job 2 to finish
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform -chdir=${{ env.TF_DIR }} init
+
+      - name: Terraform Apply (Full)
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} apply -auto-approve \
+            -var="image_tag=${{ needs.build-and-push-image.outputs.image_tag }}"

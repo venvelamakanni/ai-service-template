@@ -16,10 +16,69 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 # -----------------------------------------------------------------
-# Resource 1: Elastic Container Registry (ECR)
+# Resource 1: IAM Role for App Runner to access ECR
+# -----------------------------------------------------------------
+resource "aws_iam_role" "apprunner_ecr_access" {
+  name = "${var.app_name}-apprunner-ecr-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "build.apprunner.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Project = var.app_name
+  }
+}
+
+resource "aws_iam_role_policy" "apprunner_ecr_access" {
+  name = "${var.app_name}-apprunner-ecr-policy"
+  role = aws_iam_role.apprunner_ecr_access.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:DescribeRepositories",
+          "ecr:DescribeImages"
+        ]
+        Resource = aws_ecr_repository.main.arn
+      }
+    ]
+  })
+}
+
+# -----------------------------------------------------------------
+# Resource 2: Elastic Container Registry (ECR)
 # -----------------------------------------------------------------
 resource "aws_ecr_repository" "main" {
   name = "${var.app_name}-ecr-repo"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  image_tag_mutability = "MUTABLE"
 
   tags = {
     Project = var.app_name
@@ -41,9 +100,7 @@ resource "aws_apprunner_service" "main" {
       }
     }
     authentication_configuration {
-      # This is a pre-defined role App Runner uses to access ECR
-      # This assumes it exists. For a more robust setup, we'd create this role too.
-      access_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/service-role/AppRunnerECRAccessRole"
+      access_role_arn = aws_iam_role.apprunner_ecr_access.arn
     }
   }
 

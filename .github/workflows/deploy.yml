@@ -48,7 +48,26 @@ jobs:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ... (rest of the job) ...
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform -chdir=${{ env.TF_DIR }} init
+
+      - name: Terraform Apply (Base Infrastructure)
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} apply -auto-approve \
+            -target=aws_iam_role.apprunner_ecr_access \
+            -target=aws_iam_role_policy.apprunner_ecr_access \
+            -target=aws_ecr_repository.main \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="app_name=${{ env.APP_NAME }}" \
+            -var="image_tag=placeholder"
+
+      - name: Get Terraform Outputs
+        id: tf_output
+        run: |
+          echo "ecr_repo_url=$(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
   # -----------------------------------------------------------------
   # Job 2: Build and Push Docker Image
   # This job runs *after* the ECR repo is created.
@@ -115,4 +134,12 @@ jobs:
       - name: Terraform Apply (Full)
         run: |
           terraform -chdir=${{ env.TF_DIR }} apply -auto-approve \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="app_name=${{ env.APP_NAME }}" \
             -var="image_tag=${{ needs.build-and-push-image.outputs.image_tag }}"
+
+      - name: Get Service URL
+        run: |
+          echo "🚀 Service deployed successfully!"
+          echo "Service URL: $(terraform -chdir=${{ env.TF_DIR }} output -raw service_url)"
+          echo "ECR Repository: $(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url)"

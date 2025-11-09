@@ -29,29 +29,164 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: 🐞 Debug Repository Context
+      - name: 🔍 Validate GitHub Secrets
         run: |
-          echo "Repository: ${{ github.repository }}"
-          echo "Repository owner: ${{ github.repository_owner }}"
-          echo "Repository name: ${{ github.event.repository.name }}"
-          echo "Full repo context: repo:${{ github.repository }}:*"
-          echo ""
-          echo "Use this exact value in your trust policy:"
-          echo "  \"token.actions.githubusercontent.com:sub\": \"repo:${{ github.repository }}:*\""
+          echo "Checking required GitHub Secrets..."
+          if [ -z "${{ secrets.AWS_REGION }}" ]; then
+            echo "❌ ERROR: AWS_REGION secret is not set"
+            echo "   → Go to Settings → Secrets and variables → Actions"
+            echo "   → Add secret: AWS_REGION (e.g., us-east-1)"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_IAM_ROLE_ARN }}" ]; then
+            echo "❌ ERROR: AWS_IAM_ROLE_ARN secret is not set"
+            echo "   → Go to Settings → Secrets and variables → Actions"
+            echo "   → Add secret: AWS_IAM_ROLE_ARN (e.g., arn:aws:iam::ACCOUNT:role/ROLE_NAME)"
+            exit 1
+          fi
+          echo "✅ GitHub Secrets validated (values are masked for security)"
 
       - name: Configure AWS credentials
+        id: aws_creds
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+        continue-on-error: true
+
+      - name: 🔍 Validate AWS Connection
+        run: |
+          if [ "${{ steps.aws_creds.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Failed to configure AWS credentials"
+            echo ""
+            echo "Common issues:"
+            echo "  1. OIDC Trust Policy not configured correctly"
+            echo "     → Check IAM role trust policy allows GitHub Actions"
+            echo "     → Verify repository name matches trust policy condition"
+            echo "  2. IAM Role ARN is incorrect"
+            echo "     → Verify AWS_IAM_ROLE_ARN secret is correct"
+            echo "     → Format: arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME"
+            echo "  3. OIDC Provider not configured"
+            echo "     → Check IAM → Identity providers → token.actions.githubusercontent.com"
+            echo ""
+            echo "See SECURITY.md for setup instructions"
+            exit 1
+          fi
+          
+          echo "✅ AWS credentials configured successfully"
+          
+          # Test AWS connection (without exposing account info)
+          if ! aws sts get-caller-identity &>/dev/null; then
+            echo "❌ ERROR: Cannot connect to AWS"
+            echo "   → Check IAM role permissions"
+            echo "   → Verify AWS region is correct"
+            exit 1
+          fi
+          
+          echo "✅ AWS connection verified"
+
+      - name: 🔍 Validate Terraform Backend
+        run: |
+          echo "Checking Terraform backend configuration..."
+          if [ ! -f "${{ env.TF_DIR }}/backend.tf" ]; then
+            echo "❌ ERROR: backend.tf not found in ${{ env.TF_DIR }}/"
+            exit 1
+          fi
+          
+          # Check if backend.tf has required fields (without exposing values)
+          if ! grep -q "bucket" "${{ env.TF_DIR }}/backend.tf"; then
+            echo "❌ ERROR: S3 bucket not configured in backend.tf"
+            echo "   → Update terraform/backend.tf with your S3 bucket name"
+            exit 1
+          fi
+          
+          if ! grep -q "dynamodb_table" "${{ env.TF_DIR }}/backend.tf"; then
+            echo "❌ ERROR: DynamoDB table not configured in backend.tf"
+            echo "   → Update terraform/backend.tf with your DynamoDB table name"
+            exit 1
+          fi
+          
+          echo "✅ Terraform backend configuration found"
+
+      - name: 🔍 Check AWS Prerequisites
+        run: |
+          echo "Checking AWS prerequisites..."
+          
+          # Get backend bucket name from terraform (without exposing it)
+          BUCKET_NAME=$(grep -A 1 'bucket\s*=' "${{ env.TF_DIR }}/backend.tf" | grep -o '"[^"]*"' | tr -d '"' | head -1)
+          TABLE_NAME=$(grep -A 1 'dynamodb_table\s*=' "${{ env.TF_DIR }}/backend.tf" | grep -o '"[^"]*"' | tr -d '"' | head -1)
+          
+          if [ -z "$BUCKET_NAME" ] || [ -z "$TABLE_NAME" ]; then
+            echo "⚠️  WARNING: Could not parse backend configuration"
+            echo "   → Manually verify S3 bucket and DynamoDB table exist"
+          else
+            # Check S3 bucket exists (without exposing bucket name in logs)
+            if ! aws s3 ls "s3://$BUCKET_NAME" &>/dev/null 2>&1; then
+              echo "❌ ERROR: S3 bucket for Terraform state does not exist or is not accessible"
+              echo "   → Create the S3 bucket specified in terraform/backend.tf"
+              echo "   → Enable versioning on the bucket"
+              echo "   → Verify IAM role has s3:ListBucket and s3:GetObject permissions"
+              echo "   → Check that the bucket name in backend.tf is correct"
+              exit 1
+            fi
+            echo "✅ S3 bucket for Terraform state is accessible"
+            
+            # Check DynamoDB table exists (without exposing table name in logs)
+            if ! aws dynamodb describe-table --table-name "$TABLE_NAME" &>/dev/null 2>&1; then
+              echo "❌ ERROR: DynamoDB table for Terraform locking does not exist"
+              echo "   → Create the DynamoDB table specified in terraform/backend.tf"
+              echo "   → Table must have partition key: LockID (String)"
+              echo "   → Verify IAM role has dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem permissions"
+              echo "   → Check that the table name in backend.tf is correct"
+              exit 1
+            fi
+            echo "✅ DynamoDB table for Terraform locking is accessible"
+          fi
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
+        id: tf_init
         run: terraform -chdir=${{ env.TF_DIR }} init
+        continue-on-error: true
+
+      - name: 🔍 Check Terraform Init
+        run: |
+          if [ "${{ steps.tf_init.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Terraform init failed"
+            echo ""
+            echo "Common issues:"
+            echo "  1. S3 bucket for state does not exist"
+            echo "     → Create the bucket specified in terraform/backend.tf"
+            echo "     → Enable versioning on the bucket"
+            echo "  2. DynamoDB table for locking does not exist"
+            echo "     → Create the table specified in terraform/backend.tf"
+            echo "     → Table must have partition key: LockID (String)"
+            echo "  3. IAM permissions insufficient"
+            echo "     → Verify IAM role has s3:* and dynamodb:* permissions"
+            echo "  4. Backend configuration incorrect"
+            echo "     → Check terraform/backend.tf for typos"
+            echo "     → Verify bucket name and table name are correct"
+            echo "  5. Terraform configuration syntax errors"
+            echo "     → Check Terraform files for syntax errors"
+            echo ""
+            exit 1
+          fi
+          echo "✅ Terraform initialized successfully"
+          
+          # Validate Terraform configuration after init
+          echo "Validating Terraform configuration..."
+          if ! terraform -chdir=${{ env.TF_DIR }} validate &>/dev/null; then
+            echo "❌ ERROR: Terraform configuration is invalid"
+            echo "   → Fix any syntax errors in Terraform files"
+            terraform -chdir=${{ env.TF_DIR }} validate
+            exit 1
+          fi
+          echo "✅ Terraform configuration is valid"
 
       - name: Terraform Apply (Base Infrastructure)
+        id: tf_apply
         run: |
           terraform -chdir=${{ env.TF_DIR }} apply -auto-approve \
             -target=aws_iam_role.apprunner_ecr_access \
@@ -60,11 +195,59 @@ jobs:
             -var="aws_region=${{ env.AWS_REGION }}" \
             -var="app_name=${{ env.APP_NAME }}" \
             -var="image_tag=placeholder"
+        continue-on-error: true
+
+      - name: 🔍 Check Terraform Apply
+        run: |
+          if [ "${{ steps.tf_apply.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Terraform apply failed"
+            echo ""
+            echo "Common issues:"
+            echo "  1. IAM permissions insufficient"
+            echo "     → Verify IAM role has iam:CreateRole, iam:PutRolePolicy, ecr:CreateRepository permissions"
+            echo "  2. Resource name conflicts"
+            echo "     → Check if resources with same name already exist"
+            echo "  3. AWS service limits"
+            echo "     → Check AWS service quotas"
+            echo ""
+            exit 1
+          fi
+          echo "✅ Base infrastructure created successfully"
+
+      - name: Refresh Terraform State
+        run: |
+          echo "Refreshing Terraform state to ensure outputs are current..."
+          terraform -chdir=${{ env.TF_DIR }} refresh -target=aws_ecr_repository.main || true
+          echo "✅ Terraform state refreshed"
 
       - name: Get Terraform Outputs
         id: tf_output
         run: |
-          echo "ecr_repo_url=$(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+          echo "Getting ECR repository URL from Terraform outputs..."
+          
+          # List all outputs for debugging (without exposing sensitive values)
+          echo "Available Terraform outputs:"
+          terraform -chdir=${{ env.TF_DIR }} output || echo "No outputs available"
+          
+          # Get ECR repository URL
+          ECR_URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url 2>/dev/null || echo "")
+          
+          if [ -z "$ECR_URL" ] || [ "$ECR_URL" = "null" ]; then
+            echo "❌ ERROR: Failed to get ECR repository URL from Terraform"
+            echo ""
+            echo "Troubleshooting steps:"
+            echo "  1. Check if Terraform apply completed successfully"
+            echo "  2. Verify terraform/outputs.tf has ecr_repository_url output"
+            echo "  3. Check if ECR repository resource was created:"
+            echo "     terraform -chdir=${{ env.TF_DIR }} state list | grep ecr"
+            echo "  4. Verify output value:"
+            echo "     terraform -chdir=${{ env.TF_DIR }} output ecr_repository_url"
+            echo ""
+            exit 1
+          fi
+          
+          echo "✅ ECR repository URL retrieved successfully"
+          echo "ecr_repo_url=$ECR_URL" >> $GITHUB_OUTPUT
   # -----------------------------------------------------------------
   # Job 2: Build and Push Docker Image
   # This job runs *after* the ECR repo is created.
@@ -85,23 +268,125 @@ jobs:
         id: get_sha
         run: echo "sha=$(echo ${GITHUB_SHA::7})" >> $GITHUB_OUTPUT
 
+      - name: 🔍 Validate ECR Repository URL
+        run: |
+          ECR_URL="${{ needs.deploy-base-infra.outputs.ecr_repo_url }}"
+          
+          if [ -z "$ECR_URL" ] || [ "$ECR_URL" = "null" ]; then
+            echo "❌ ERROR: ECR repository URL not available from previous job"
+            echo ""
+            echo "Troubleshooting steps:"
+            echo "  1. Check Job 1 (Deploy Base Infra) completed successfully"
+            echo "  2. Verify Terraform outputs are configured correctly"
+            echo "  3. Check terraform/outputs.tf has ecr_repository_url output"
+            echo "  4. Verify ECR repository was created in Job 1"
+            echo ""
+            exit 1
+          fi
+          
+          # Validate ECR URL format
+          if [[ ! "$ECR_URL" =~ ^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/ ]]; then
+            echo "⚠️  WARNING: ECR URL format may be incorrect: $ECR_URL"
+            echo "   Expected format: ACCOUNT.dkr.ecr.REGION.amazonaws.com/REPO-NAME"
+          fi
+          
+          echo "✅ ECR repository URL validated: $ECR_URL"
+
       - name: Configure AWS credentials
+        id: aws_creds_job2
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+        continue-on-error: true
+
+      - name: 🔍 Validate AWS Connection (Job 2)
+        run: |
+          if [ "${{ steps.aws_creds_job2.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Failed to configure AWS credentials"
+            echo "   → See Job 1 error messages for troubleshooting"
+            exit 1
+          fi
+          echo "✅ AWS credentials configured"
 
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+        continue-on-error: true
+
+      - name: 🔍 Check ECR Login
+        run: |
+          if [ "${{ steps.login-ecr.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Failed to log in to Amazon ECR"
+            echo ""
+            echo "Common issues:"
+            echo "  1. ECR repository does not exist"
+            echo "     → Verify Job 1 completed successfully"
+            echo "  2. IAM permissions insufficient"
+            echo "     → Verify IAM role has ecr:GetAuthorizationToken permission"
+            echo "  3. Repository URL is incorrect"
+            echo "     → Check Terraform outputs in Job 1"
+            echo ""
+            exit 1
+          fi
+          echo "✅ Successfully logged in to Amazon ECR"
+
+      - name: 🔍 Validate Dockerfile
+        run: |
+          if [ ! -f "Dockerfile" ]; then
+            echo "❌ ERROR: Dockerfile not found"
+            echo "   → Create a Dockerfile in the repository root"
+            exit 1
+          fi
+          echo "✅ Dockerfile found"
 
       - name: Build, tag, and push image to Amazon ECR
+        id: docker_build
         env:
           ECR_REPOSITORY_URL: ${{ needs.deploy-base-infra.outputs.ecr_repo_url }}
           IMAGE_TAG: ${{ steps.get_sha.outputs.sha }}
         run: |
+          # Validate environment variables before building
+          if [ -z "$ECR_REPOSITORY_URL" ]; then
+            echo "❌ ERROR: ECR_REPOSITORY_URL is empty"
+            echo "   → Check Job 1 outputs"
+            echo "   → Verify Terraform output ecr_repository_url exists"
+            exit 1
+          fi
+          
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "❌ ERROR: IMAGE_TAG is empty"
+            echo "   → Check Git commit SHA step"
+            exit 1
+          fi
+          
+          echo "Building Docker image..."
+          echo "Repository: $ECR_REPOSITORY_URL"
+          echo "Tag: $IMAGE_TAG"
+          echo "Full image: $ECR_REPOSITORY_URL:$IMAGE_TAG"
+          
           docker build -t $ECR_REPOSITORY_URL:$IMAGE_TAG .
           docker push $ECR_REPOSITORY_URL:$IMAGE_TAG
+        continue-on-error: true
+
+      - name: 🔍 Check Docker Build and Push
+        run: |
+          if [ "${{ steps.docker_build.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Docker build or push failed"
+            echo ""
+            echo "Common issues:"
+            echo "  1. Dockerfile has syntax errors"
+            echo "     → Check Dockerfile for errors"
+            echo "  2. Build dependencies missing"
+            echo "     → Verify all dependencies in requirements.txt or package.json"
+            echo "  3. ECR push permissions insufficient"
+            echo "     → Verify IAM role has ecr:BatchCheckLayerAvailability, ecr:PutImage permissions"
+            echo "  4. Image size too large"
+            echo "     → Optimize Dockerfile to reduce image size"
+            echo ""
+            exit 1
+          fi
+          echo "✅ Docker image built and pushed successfully"
 
   # -----------------------------------------------------------------
   # Job 3: Deploy App Service
@@ -116,27 +401,95 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: 🔍 Validate Image Tag
+        run: |
+          if [ -z "${{ needs.build-and-push-image.outputs.image_tag }}" ]; then
+            echo "❌ ERROR: Image tag not available from previous job"
+            echo "   → Check Job 2 (Build and Push Docker Image) for errors"
+            exit 1
+          fi
+          echo "✅ Image tag received: ${{ needs.build-and-push-image.outputs.image_tag }}"
+
       - name: Configure AWS credentials
+        id: aws_creds_job3
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+        continue-on-error: true
+
+      - name: 🔍 Validate AWS Connection (Job 3)
+        run: |
+          if [ "${{ steps.aws_creds_job3.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Failed to configure AWS credentials"
+            echo "   → See Job 1 error messages for troubleshooting"
+            exit 1
+          fi
+          echo "✅ AWS credentials configured"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
+        id: tf_init_job3
         run: terraform -chdir=${{ env.TF_DIR }} init
+        continue-on-error: true
+
+      - name: 🔍 Check Terraform Init (Job 3)
+        run: |
+          if [ "${{ steps.tf_init_job3.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Terraform init failed"
+            echo "   → See Job 1 error messages for troubleshooting"
+            exit 1
+          fi
+          echo "✅ Terraform initialized successfully"
 
       - name: Terraform Apply (Full)
+        id: tf_apply_full
         run: |
           terraform -chdir=${{ env.TF_DIR }} apply -auto-approve \
             -var="aws_region=${{ env.AWS_REGION }}" \
             -var="app_name=${{ env.APP_NAME }}" \
             -var="image_tag=${{ needs.build-and-push-image.outputs.image_tag }}"
+        continue-on-error: true
+
+      - name: 🔍 Check Terraform Apply (Full)
+        run: |
+          if [ "${{ steps.tf_apply_full.outcome }}" != "success" ]; then
+            echo "❌ ERROR: Terraform apply failed"
+            echo ""
+            echo "Common issues:"
+            echo "  1. App Runner service creation failed"
+            echo "     → Check IAM role has apprunner:CreateService permission"
+            echo "     → Verify ECR image exists and is accessible"
+            echo "  2. Image not found in ECR"
+            echo "     → Verify Job 2 completed successfully"
+            echo "     → Check image tag matches the one pushed to ECR"
+            echo "  3. Health check configuration incorrect"
+            echo "     → Verify /health endpoint exists in your application"
+            echo "     → Check health_check_configuration in terraform/main.tf"
+            echo "  4. IAM role for App Runner not found"
+            echo "     → Verify Job 1 created the IAM role"
+            echo "     → Check IAM role name matches terraform configuration"
+            echo ""
+            exit 1
+          fi
+          echo "✅ Application deployed successfully"
 
       - name: Get Service URL
+        id: service_url
         run: |
-          echo "🚀 Service deployed successfully!"
-          echo "Service URL: $(terraform -chdir=${{ env.TF_DIR }} output -raw service_url)"
-          echo "ECR Repository: $(terraform -chdir=${{ env.TF_DIR }} output -raw ecr_repository_url)"
+          SERVICE_URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw service_url 2>/dev/null || echo "")
+          if [ -z "$SERVICE_URL" ]; then
+            echo "⚠️  WARNING: Could not retrieve service URL"
+            echo "   → Check Terraform outputs configuration"
+            echo "   → Verify App Runner service was created successfully"
+          else
+            echo "🚀 Service deployed successfully!"
+            echo "Service URL: $SERVICE_URL"
+            echo ""
+            echo "✅ Your application is now live!"
+            echo "   → Wait a few minutes for the service to become healthy"
+            echo "   → Visit the Service URL to access your application"
+          fi
+        continue-on-error: true

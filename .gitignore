@@ -17,6 +17,18 @@ terraform.tfstate.backup
 
 # Trust policy files (temporary, should not be committed)
 trust-policy*.json
+*TRUST_POLICY*.md
+*OIDC*.md
+*trust-policy*.sh
+*verify-trust*.sh
+*debug-oidc*.sh
+*fix-oidc*.sh
+*find-exact-repo*.sh
+*check-cloudtrail*.sh
+*FIX_OIDC*.md
+*UPDATE_TRUST*.md
+*ADD_IAM*.md
+*QUICK_FIX*.md
 
 # Python
 __pycache__/
